@@ -1,0 +1,180 @@
+# Multi-stage build for CocoIndex + PostgreSQL
+# Stage 1: Build stage with all build dependencies
+FROM ubuntu:22.04 AS builder
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install apt-fast for faster downloads
+RUN apt-get update && apt-get install -y software-properties-common && \
+    add-apt-repository ppa:apt-fast/stable && \
+    apt-get update && \
+    echo apt-fast apt-fast/maxdownloads string 10 | debconf-set-selections && \
+    echo apt-fast apt-fast/dlflag boolean true | debconf-set-selections && \
+    echo apt-fast apt-fast/aptmanager string apt | debconf-set-selections && \
+    apt-get install -y apt-fast && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install build dependencies
+RUN apt-fast update && apt-fast install -y \
+    postgresql-server-dev-14 \
+    python3 \
+    python3-pip \
+    python3-venv \
+    curl \
+    wget \
+    build-essential \
+    git \
+    cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install pgvector extension from source
+RUN git clone --branch v0.5.1 https://github.com/pgvector/pgvector.git /tmp/pgvector && \
+    cd /tmp/pgvector && \
+    make && \
+    make install && \
+    rm -rf /tmp/pgvector
+
+# Copy UV from the official Astral Docker image
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# Set up application directory for building
+WORKDIR /app
+
+# Copy dependency files for caching optimization
+COPY pyproject.toml ./
+COPY uv.lock* ./
+
+# Generate lock file only if it doesn't exist, then install dependencies
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ ! -f uv.lock ]; then \
+        echo "Generating lock file..." && \
+        uv lock; \
+    fi && \
+    echo "Installing dependencies..." && \
+    uv sync --frozen --no-install-project
+
+# Copy only the essential files for building
+COPY python/ ./python/
+COPY src/ ./src/
+COPY Cargo.toml Cargo.lock ./
+COPY standalone_watcher.py ./
+COPY README.md ./
+
+# Install the project itself
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen
+
+# Stage 2: Runtime stage with only runtime dependencies
+FROM ubuntu:22.04 AS runtime
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+ENV POSTGRES_DB=cocoindex
+ENV POSTGRES_USER=cocoindex
+ENV POSTGRES_PASSWORD=cocoindex
+ENV COCOINDEX_DATABASE_URL=postgres://cocoindex:cocoindex@localhost:5432/cocoindex
+
+# Install apt-fast for faster downloads
+RUN apt-get update && apt-get install -y software-properties-common && \
+    add-apt-repository ppa:apt-fast/stable && \
+    apt-get update && \
+    echo apt-fast apt-fast/maxdownloads string 10 | debconf-set-selections && \
+    echo apt-fast apt-fast/dlflag boolean true | debconf-set-selections && \
+    echo apt-fast apt-fast/aptmanager string apt | debconf-set-selections && \
+    apt-get install -y apt-fast && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install only runtime dependencies (optimized - no pip/venv since we copy .venv from builder)
+RUN apt-fast update && apt-fast install -y \
+    postgresql-14 \
+    postgresql-contrib-14 \
+    python3 \
+    supervisor \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy built pgvector extension from builder stage
+COPY --from=builder /usr/lib/postgresql/14/lib/vector.so /usr/lib/postgresql/14/lib/
+COPY --from=builder /usr/share/postgresql/14/extension/vector* /usr/share/postgresql/14/extension/
+
+# Copy Python virtual environment from builder stage
+COPY --from=builder /app/.venv /app/.venv
+
+# Copy only the essential runtime files from builder stage
+COPY --from=builder /app/standalone_watcher.py /app/
+COPY --from=builder /app/python/ /app/python/
+COPY --from=builder /app/pyproject.toml /app/
+COPY --from=builder /app/README.md /app/
+
+# Set working directory
+WORKDIR /app
+
+# Configure PostgreSQL
+RUN echo "host all all 0.0.0.0/0 md5" >> /etc/postgresql/14/main/pg_hba.conf && \
+    echo "listen_addresses = '*'" >> /etc/postgresql/14/main/postgresql.conf
+
+# Initialize PostgreSQL
+# Use systemd service management approach but with proper user setup
+RUN systemctl --version || (echo "systemctl not available, using direct approach" && \
+    service postgresql start && \
+    runuser -l postgres -c "psql -c \"CREATE USER cocoindex WITH PASSWORD 'cocoindex';\"" && \
+    runuser -l postgres -c "psql -c \"CREATE DATABASE cocoindex OWNER cocoindex;\"" && \
+    runuser -l postgres -c "psql -d cocoindex -c \"CREATE EXTENSION vector;\"" && \
+    service postgresql stop)
+
+# Create log directories
+RUN mkdir -p /var/log/postgresql /var/log/cocoindex /var/log/supervisor
+
+# Create application startup script
+RUN printf '#!/bin/bash\n\
+set -e\n\
+\n\
+# Start PostgreSQL\n\
+service postgresql start\n\
+\n\
+# Wait for PostgreSQL to be ready\n\
+until pg_isready -h localhost -p 5432 -U cocoindex; do\n\
+    echo "Waiting for PostgreSQL..."\n\
+    sleep 1\n\
+done\n\
+\n\
+# Test database connection\n\
+echo "Testing database connection..."\n\
+cd /app\n\
+/app/.venv/bin/python -c "import psycopg2; conn = psycopg2.connect('"'"'host=localhost port=5432 dbname=cocoindex user=cocoindex password=cocoindex'"'"'); print('"'"'Database connection successful'"'"'); conn.close()"\n\
+\n\
+# Start the file watcher with provided arguments\n\
+exec /app/.venv/bin/python /app/standalone_watcher.py "$@"\n' > /app/start.sh && chmod +x /app/start.sh
+
+# Create supervisor configuration
+RUN printf '[supervisord]\n\
+nodaemon=true\n\
+user=root\n\
+logfile=/var/log/supervisor/supervisord.log\n\
+pidfile=/var/run/supervisord.pid\n\
+\n\
+[program:postgresql]\n\
+command=/usr/lib/postgresql/14/bin/postgres -D /var/lib/postgresql/14/main -c config_file=/etc/postgresql/14/main/postgresql.conf\n\
+user=postgres\n\
+autostart=true\n\
+autorestart=true\n\
+stderr_logfile=/var/log/postgresql/postgresql.err.log\n\
+stdout_logfile=/var/log/postgresql/postgresql.out.log\n\
+\n\
+[program:cocoindex]\n\
+command=/app/start.sh\n\
+directory=/app\n\
+user=root\n\
+autostart=true\n\
+autorestart=true\n\
+stderr_logfile=/var/log/cocoindex/cocoindex.err.log\n\
+stdout_logfile=/var/log/cocoindex/cocoindex.out.log\n' > /etc/supervisor/conf.d/cocoindex.conf
+
+# Expose ports (5432 for PostgreSQL, 8000 for potential MCP server)
+EXPOSE 5432 8000
+
+# Set the entrypoint
+ENTRYPOINT ["/app/start.sh"]
+
+# Default command - watch current directory
+CMD ["--watch-path", "/data", "--verbose"] 

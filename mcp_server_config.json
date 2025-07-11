@@ -1,0 +1,32 @@
+{
+  "mcpServers": {
+    "cocoindex": {
+      "command": "cocoindex-watcher",
+      "args": [
+        "/path/to/watch",
+        "example_flow.py",
+        "--with-mcp-server",
+        "--address",
+        "0.0.0.0:8000",
+        "--flow-file",
+        "example_flow.py"
+      ],
+      "env": {
+        "COCOINDEX_DATABASE_URL": "postgres://cocoindex:cocoindex@localhost:5432/cocoindex"
+      }
+    },
+    "cocoindex-mcp-only": {
+      "command": "cocoindex-watcher",
+      "args": [
+        "--mcp-server-only",
+        "--address",
+        "0.0.0.0:8000",
+        "--flow-file",
+        "example_flow.py"
+      ],
+      "env": {
+        "COCOINDEX_DATABASE_URL": "postgres://cocoindex:cocoindex@localhost:5432/cocoindex"
+      }
+    }
+  }
+} 
